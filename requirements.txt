@@ -1,0 +1,8 @@
+numpy>=1.24
+pandas>=1.5
+scipy>=1.9
+scikit-learn>=1.2
+python-igraph>=0.10
+leidenalg>=0.10
+torch>=2.0
+tqdm>=4.60
