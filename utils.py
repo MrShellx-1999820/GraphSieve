@@ -1,18 +1,41 @@
 import numpy as np
 import pandas as pd
+from scapy.all import PcapReader, Raw
+from scapy.layers.inet import IP
 from pathlib import Path
+from joblib import dump, load
 from typing import List, Tuple
 from collections import Counter
+# ------- New: stratified sampling -------
 from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 from sklearn.linear_model import SGDClassifier
 from detector import TorchAEAnomalyDetector, TorchN3ICDetector
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import auc
+import matplotlib.pyplot as plt
+
+# ---------- Feature params ----------
+MAX_PKTS = 256
+HIST_BINS = 32
+FFT_TOPK = 16
+MAX_PKT_LEN = 1500
 
 
 def build_model(model_type: str):
     """Return a scikit-learn-style model according to model_type."""
-    if model_type == "svm":
+    if model_type == "rf":
+        return RandomForestClassifier(
+            n_estimators=200,
+            n_jobs=-1,
+            random_state=42
+        )
+
+    elif model_type == "svm":
         # Use SGDClassifier + hinge to approximate a linear SVM (multi-threaded)
         # Note: no predict_proba; the caller already handles this via try/except
         return make_pipeline(
@@ -25,6 +48,23 @@ def build_model(model_type: str):
                 n_jobs=-1,  # parallelize
                 random_state=42
             )
+        )
+
+    elif model_type == "tree":
+        return DecisionTreeClassifier(random_state=42)
+
+    elif model_type == "xgb":
+        return XGBClassifier(
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            n_jobs=-1,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            random_state=42,
         )
 
     elif model_type == "ae":
@@ -93,29 +133,41 @@ def load_full_dataset(DATA_ROOT, dataset_name: str, data_type: str):
       - "csv": mainly IDS2017 / CICIDS2017
       - "pcap": reuse _load_split but merge everything into a single all set
     """
-    if data_type != "csv":
-        raise ValueError(f"Unsupported data_type: {data_type} (only csv is supported)")
+    dataset_key = dataset_name.lower().replace("_", "-")
 
-    name = dataset_name.lower()
-    if name in ["ids2017", "malicious_tls", "kdd"]:
-        return load_ids2017_merged(DATA_ROOT, dataset_name)
-    if "unsw-nb15" in name:
-        return load_unsw15_merged(DATA_ROOT, dataset_name)
-    raise ValueError(f"Unsupported dataset: {dataset_name} "
-                     "(supported: ids2017, Malicious_TLS, kdd, unsw-nb15)")
+    if data_type == "csv":
+        # dataset_name can be used here to choose the right loader
+        name = dataset_name.lower()
+        if name in ["ids2017", "dapt-2020", "ddos-2019", "malicious_tls", "kdd", "iot-2023", "ids2017-lowvar"]:
+            return load_ids2017_merged(DATA_ROOT, dataset_name)
+        if "unsw-nb15" in name:
+            return load_unsw15_merged(DATA_ROOT, dataset_name)
+        else:
+            return load_generic_csv_dataset(DATA_ROOT, dataset_name)
+    elif data_type == "pcap":
+        pass
+    else:
+        raise ValueError(f"Unknown data_type: {data_type}")
 
 
 def load_ids2017_merged(DATA_ROOT, dataset_name: str):
     """
     Low-memory CSV loader for IDS/CIC-style data.
 
-    Supported: ids2017, malicious_tls, kdd.
+    Supported:
+      - ids2017
+      - malicious_tls
+      - kdd
+      - iot-2023
+      - dapt-2020
+      - ddos-2019
 
     Core optimizations:
       1. Do not read all CSVs into memory at once;
       2. Read file by file, chunk by chunk;
       3. Build labels, convert features, and clean NaN/Inf within each chunk;
-      4. Keep only cleaned X/y/meta and concatenate numpy arrays at the end.
+      4. Keep only cleaned X/y/meta and concatenate numpy arrays at the end;
+      5. For ddos-2019 / iot-2023, keep the original 1% stratified sampling idea but sample within chunks to avoid holding the full DataFrame in memory.
 
     Returns:
       X_all: float32 feature matrix
@@ -134,7 +186,12 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found under {ds_dir}")
 
-    dataset_key_base = dataset_name.lower().replace("_", "-")
+    dataset_key = dataset_name.lower().replace("_", "-")
+    # allows downstream subset names such as ids2017-lowvar / kdd-lowvar
+    if dataset_key.endswith("-lowvar"):
+        dataset_key_base = dataset_key.replace("-lowvar", "")
+    else:
+        dataset_key_base = dataset_key
 
     chunksize = 100_000
 
@@ -213,6 +270,23 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
                 rec.update(extra_meta_getter(local_i))
             meta_all.append(rec)
 
+    def _sample_chunk_indices(y_valid: np.ndarray, frac=0.01, seed=42):
+        """
+        Stratified label sampling within each cleaned chunk.
+        Used for ddos-2019 / iot-2023, approximating the original global (origin_file, label) stratified sampling.
+        """
+        rng = np.random.default_rng(seed)
+        picked = []
+        for lab in np.unique(y_valid):
+            idx = np.where(y_valid == lab)[0]
+            n = int(np.ceil(len(idx) * frac))
+            n = max(1, n)
+            if n >= len(idx):
+                picked.extend(idx.tolist())
+            else:
+                picked.extend(rng.choice(idx, size=n, replace=False).tolist())
+        return np.array(sorted(picked), dtype=int)
+
     def _strict_chunk_to_features(df: pd.DataFrame, drop_cols: List[str], feature_names):
         """
         Strict mode:
@@ -277,9 +351,9 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
 
     print(f"[INFO] Loading {dataset_name} from {ds_dir} with chunk size {chunksize}")
 
-    # ========= 1. IDS2017 / Malicious_TLS / KDD =========
-    if dataset_key_base in ["ids2017", "malicious-tls", "malicious_tls", "kdd"]:
-        if dataset_key_base == "ids2017":
+    # ========= 1. IDS2017 / Malicious_TLS / KDD / IoT-2023 =========
+    if dataset_key_base in ["ids2017", "malicious-tls", "malicious_tls", "kdd", "iot-2023", "ids2017-lowvar"]:
+        if dataset_key_base in ["ids2017", "ids2017-lowvar"]:
             label_col = " Label"
             benign_str = "BENIGN"
             drop_cols = [" Destination Port", label_col, "__origin_file"]
@@ -298,6 +372,11 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
             label_col = "Class"
             benign_str = "0"
             drop_cols = [label_col, "__origin_file"]
+
+        else:  # iot-2023
+            label_col = "Label"
+            benign_str = "BENIGN"
+            drop_cols = [" Destination Port", label_col, "__origin_file"]
 
         for file_id, csv_path in enumerate(csv_files):
             print(f"[INFO] reading {csv_path.name}")
@@ -323,6 +402,21 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
                     drop_cols=drop_cols,
                     feature_names=feature_names,
                 )
+
+                # the original loader did 1% stratified sampling for iot-2023; keep the low-memory approximation here.
+                # this branch does not handle ddos-2019.
+                if dataset_key_base == "iot-2023":
+                    valid_pos = np.where(keep_mask)[0]
+                    if len(valid_pos) > 0:
+                        local_y_valid = y_chunk[valid_pos]
+                        picked_local = _sample_chunk_indices(
+                            local_y_valid,
+                            frac=0.01,
+                            seed=42 + file_id * 1000 + chunk_id,
+                        )
+                        sampled_keep = np.zeros_like(keep_mask, dtype=bool)
+                        sampled_keep[valid_pos[picked_local]] = True
+                        keep_mask = sampled_keep
 
                 kept = int(keep_mask.sum())
                 dropped = int(len(df) - kept)
@@ -351,20 +445,207 @@ def load_ids2017_merged(DATA_ROOT, dataset_name: str):
                         f"total_kept={total_kept}"
                     )
 
+    # ========= 2. DAPT-2020 =========
+    elif dataset_key_base == "dapt-2020":
+        for file_id, csv_path in enumerate(csv_files):
+            print(f"[INFO] reading {csv_path.name}")
+            for chunk_id, df in enumerate(_iter_chunks_robust(csv_path)):
+                df["__origin_file"] = csv_path.name
+                total_rows += len(df)
+
+                label_col = None
+                for c in ["Activity", "Stage"]:
+                    if c in df.columns:
+                        label_col = c
+                        break
+                if label_col is None:
+                    raise ValueError(
+                        f"[DAPT-2020] Expected Activity or Stage in {csv_path}, "
+                        f"columns={list(df.columns)}"
+                    )
+
+                labels_raw = df[label_col].astype(str)
+                s = labels_raw.str.strip().str.upper()
+                benign_mask = s.isin({"NORMAL", "BENIGN"})
+                y_chunk = (~benign_mask).astype(int).to_numpy()
+
+                drop_cols = [
+                    c for c in [
+                        "Flow ID",
+                        "Src IP",
+                        "Src Port",
+                        "Dst Port",
+                        "Timestamp",
+                        "Timestamps",
+                        "__origin_file",
+                    ] if c in df.columns
+                ]
+
+                feature_df, keep_mask, feature_names = _flexible_chunk_to_features(
+                    df=df,
+                    drop_cols=drop_cols,
+                    label_col=label_col,
+                    feature_names=feature_names,
+                )
+
+                kept = int(keep_mask.sum())
+                dropped = int(len(df) - kept)
+                total_kept += kept
+                total_dropped += dropped
+
+                def meta_getter(local_i):
+                    meta = {}
+                    if "Activity" in df.columns:
+                        meta["Activity"] = str(df["Activity"].iloc[local_i])
+                    if "Stage" in df.columns:
+                        meta["Stage"] = str(df["Stage"].iloc[local_i])
+                    return meta
+
+                _append_valid_rows(
+                    X_parts=X_parts,
+                    y_parts=y_parts,
+                    meta_all=meta_all,
+                    feature_df=feature_df,
+                    y_chunk=y_chunk,
+                    raw_labels=df[label_col],
+                    origin_file=csv_path.name,
+                    label_col=label_col,
+                    keep_mask=keep_mask,
+                    global_offset=global_offset,
+                    extra_meta_getter=meta_getter,
+                )
+
+                global_offset += len(df)
+
+                if chunk_id % 10 == 0:
+                    print(
+                        f"[INFO] {csv_path.name} chunk={chunk_id}, "
+                        f"rows={len(df)}, kept={kept}, total_kept={total_kept}"
+                    )
+
+    # ========= 3. CICDDoS2019 =========
+    elif dataset_key_base == "ddos-2019":
+        for file_id, csv_path in enumerate(csv_files):
+            print(f"[INFO] reading {csv_path.name}")
+            for chunk_id, df in enumerate(_iter_chunks_robust(csv_path)):
+                df["__origin_file"] = csv_path.name
+                total_rows += len(df)
+
+                label_col = None
+                for c in ["Label", " Label", "label", " label"]:
+                    if c in df.columns:
+                        label_col = c
+                        break
+                if label_col is None:
+                    raise ValueError(
+                        f"[CICDDoS2019] Expected a Label column in {csv_path}, "
+                        f"columns={list(df.columns)}"
+                    )
+
+                labels_raw = df[label_col].astype(str)
+                y_chunk = (labels_raw.str.strip() != "BENIGN").astype(int).to_numpy()
+
+                drop_cols = [
+                    c for c in [
+                        label_col,
+                        "Unnamed: 0",
+                        "__origin_file",
+                        "Flow ID",
+                        " Source IP",
+                        " Destination IP",
+                        " Timestamp",
+                        " Source Port",
+                        " Destination Port",
+                    ] if c in df.columns
+                ]
+
+                feature_df, keep_mask, feature_names = _strict_chunk_to_features(
+                    df=df,
+                    drop_cols=drop_cols,
+                    feature_names=feature_names,
+                )
+
+                # keep the original 1% stratified sampling idea, done per chunk
+                valid_pos = np.where(keep_mask)[0]
+                if len(valid_pos) > 0:
+                    local_y_valid = y_chunk[valid_pos]
+                    picked_local = _sample_chunk_indices(
+                        local_y_valid,
+                        frac=0.01,
+                        seed=42 + file_id * 1000 + chunk_id,
+                    )
+                    sampled_keep = np.zeros_like(keep_mask, dtype=bool)
+                    sampled_keep[valid_pos[picked_local]] = True
+                    keep_mask = sampled_keep
+
+                kept = int(keep_mask.sum())
+                dropped = int(len(df) - kept)
+                total_kept += kept
+                total_dropped += dropped
+
+                _append_valid_rows(
+                    X_parts=X_parts,
+                    y_parts=y_parts,
+                    meta_all=meta_all,
+                    feature_df=feature_df,
+                    y_chunk=y_chunk,
+                    raw_labels=df[label_col],
+                    origin_file=csv_path.name,
+                    label_col=label_col,
+                    keep_mask=keep_mask,
+                    global_offset=global_offset,
+                )
+
+                global_offset += len(df)
+
+                if chunk_id % 10 == 0:
+                    print(
+                        f"[INFO] {csv_path.name} chunk={chunk_id}, "
+                        f"rows={len(df)}, kept={kept}, dropped={dropped}, "
+                        f"total_kept={total_kept}"
+                    )
+
+    else:
+        raise NotImplementedError(f"Unknown dataset_name={dataset_name}")
+
+    if not X_parts:
+        raise RuntimeError(f"No valid samples loaded for {dataset_name}")
+
+    X_all = np.vstack(X_parts).astype(np.float32, copy=False)
+    y_all = np.concatenate(y_parts).astype(np.int64, copy=False)
+
+    print(
+        f"[INFO] {dataset_name}: total rows={total_rows}, "
+        f"dropped/unsampled={total_dropped}, remain={len(y_all)}"
+    )
+    print(f"[INFO] {dataset_name}: label dist: {Counter(y_all.tolist())}")
+    print(f"[INFO] {dataset_name}: X_all={X_all.shape}, num_features={len(feature_names)}")
+
+    return X_all, y_all, meta_all, feature_names
+
+
+
 def load_unsw15_merged(DATA_ROOT: Path, dataset_name: str):
     """
-    Low-memory loader for UNSW-NB15.
+    Low-memory loader for UNSW-NB15 / UNSW-NB15-lowvar.
 
     Key changes:
     1. Read chunk by chunk instead of concatenating raw DataFrames first;
     2. Encode categories, numericize, and clean NaN/Inf within each chunk;
-    3. Concatenate X/y only at the end.
+    3. Concatenate X/y only at the end;
+    4. Support unsw-nb15-lowvar/UNSW_NB15_lowvar.csv.
     """
     import numpy as np
     import pandas as pd
     from pathlib import Path
 
     ds_dir = Path(DATA_ROOT)
+    dataset_key = dataset_name.lower().replace("_", "-")
+    is_lowvar = dataset_key in {
+        "unsw-nb15-lowvar",
+        "unsw-nb15-low-variance",
+        "unsw-nb15-lowvariance",
+    }
 
     default_col_names = [
         "srcip", "sport", "dstip", "dsport", "proto", "state", "dur",
@@ -388,7 +669,7 @@ def load_unsw15_merged(DATA_ROOT: Path, dataset_name: str):
         "unsw_nb15_features.csv",
         "unsw-nb15_features.csv",
     ]
-    feat_search_dirs = [ds_dir]
+    feat_search_dirs = [ds_dir, Path("/data1/lx/dataset/unsw-nb15/CSV Files")]
     for search_dir in feat_search_dirs:
         found = False
         for name in feat_candidates:
@@ -407,14 +688,29 @@ def load_unsw15_merged(DATA_ROOT: Path, dataset_name: str):
             break
 
     # locate the data file
-    data_files = sorted(ds_dir.glob("UNSW-NB15_*.csv"))
-    data_files = [
-        p for p in data_files
-        if p.stem in {"UNSW-NB15_1", "UNSW-NB15_2", "UNSW-NB15_3", "UNSW-NB15_4"}
-    ]
-    if not data_files:
-        raise FileNotFoundError(f"No UNSW-NB15_1~4.csv found under {ds_dir}")
-    print(f"[INFO] Load UNSW-NB15 original files: {[p.name for p in data_files]}")
+    if is_lowvar:
+        patterns = ["UNSW_NB15_lowvar.csv", "UNSW-NB15-lowvar.csv", "*lowvar*.csv", "*.csv"]
+        data_files = []
+        for pat in patterns:
+            data_files = sorted(ds_dir.glob(pat))
+            data_files = [
+                p for p in data_files
+                if not any(k in p.name.lower() for k in ["feature", "list", "event", "gt"])
+            ]
+            if data_files:
+                break
+        if not data_files:
+            raise FileNotFoundError(f"No lowvar CSV found under {ds_dir}")
+        print(f"[INFO] Load UNSW-NB15 lowvar subset from: {[p.name for p in data_files]}")
+    else:
+        data_files = sorted(ds_dir.glob("UNSW-NB15_*.csv"))
+        data_files = [
+            p for p in data_files
+            if p.stem in {"UNSW-NB15_1", "UNSW-NB15_2", "UNSW-NB15_3", "UNSW-NB15_4"}
+        ]
+        if not data_files:
+            raise FileNotFoundError(f"No UNSW-NB15_1~4.csv found under {ds_dir}")
+        print(f"[INFO] Load UNSW-NB15 original files: {[p.name for p in data_files]}")
 
     label_col = "Label"
     attack_cat_col = "attack_cat"
@@ -559,6 +855,70 @@ def load_unsw15_merged(DATA_ROOT: Path, dataset_name: str):
 
 
 
+def load_generic_csv_dataset(DATA_ROOT, dataset_name: str):
+    """
+    Generic CSV loader for non-IDS2017 datasets; placeholder following load_ids2017_merged, adjust as needed.
+    """
+    ds_dir = DATA_ROOT
+    csv_path = ds_dir / f"{dataset_name}.csv"
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    # TODO: adapt to your actual format
+    raise NotImplementedError("fill me for generic csv datasets")
+
+
+# ---------- Feature extraction ----------
+def extract_pkt_lengths(pcap_path: Path, max_pkts=MAX_PKTS):
+    lens = []
+    try:
+        with PcapReader(str(pcap_path)) as pr:
+            for pkt in pr:
+                if IP in pkt and getattr(pkt[IP], 'len', None):
+                    L = int(pkt[IP].len)
+                else:
+                    try:
+                        L = int(len(bytes(pkt)))
+                    except Exception:
+                        L = int(len(bytes(pkt[Raw]))) if Raw in pkt else 0
+                lens.append(L)
+                if len(lens) >= max_pkts:
+                    break
+    except Exception as e:
+        print(f"[WARN] Failed to read {pcap_path}: {e}")
+        return []
+
+
+def stratified_subsample(X, y, paths=None, frac=None, max_per_class=None, seed=42):
+    """
+    Stratified sampling on the in-memory training set:
+      - frac: sampling ratio (0,1], e.g., 0.1 for 10%
+      - max_per_class: per-class sample cap (mutually exclusive with frac; takes priority)
+    Return the subset (X_sub, y_sub, paths_sub)
+    """
+    n = len(y)
+    if max_per_class is not None:
+        # group by class, then take at most max_per_class from each
+        idxs = []
+        for c in np.unique(y):
+            cls_idx = np.where(y == c)[0]
+            rng = np.random.default_rng(seed + int(c))
+            rng.shuffle(cls_idx)
+            take = min(max_per_class, len(cls_idx))
+            idxs.append(cls_idx[:take])
+        sel = np.concatenate(idxs)
+    elif frac is not None and 0 < frac < 1.0:
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=1 - frac, random_state=seed)
+        sel, _ = next(sss.split(np.zeros(n), y))
+    else:
+        return X, y, paths  # no sampling
+
+    sel = np.sort(sel)
+    Xs = X[sel]
+    ys = y[sel]
+    ps = [paths[i] for i in sel] if paths is not None else None
+    return Xs, ys, ps
+
+
 def make_train_test_split(y_all,
                           test_size: float = 0.3,
                           seed: int = 42,
@@ -630,3 +990,287 @@ def compute_binary_metrics(y_true, y_pred, pos_label=1):
     }
 
 
+def cluster_fp_tp_summary(cluster_labels, y_true, pos_label=1, benign_label=0, topn=50, sort_by="fp_ratio"):
+    """
+    cluster_labels: shape (N,); -1 (noise cluster) is allowed
+    y_true: shape (N,)
+    sort_by: "fp_ratio" | "fp_cnt" | "size" | "tp_cnt"
+    """
+    cluster_labels = np.asarray(cluster_labels)
+    y_true = np.asarray(y_true)
+
+    cids, inv = np.unique(cluster_labels, return_inverse=True)
+    # inv in [0, len(cids))
+    size = np.bincount(inv)
+    fp_cnt = np.bincount(inv, weights=(y_true == benign_label).astype(np.int64)).astype(int)
+    tp_cnt = np.bincount(inv, weights=(y_true == pos_label).astype(np.int64)).astype(int)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fp_ratio = fp_cnt / np.maximum(size, 1)
+        tp_ratio = tp_cnt / np.maximum(size, 1)
+
+    rows = []
+    for cid, s, f, t, fr, tr in zip(cids, size, fp_cnt, tp_cnt, fp_ratio, tp_ratio):
+        rows.append({
+            "cid": int(cid),
+            "size": int(s),
+            "fp_cnt": int(f),
+            "tp_cnt": int(t),
+            "fp_ratio": float(fr),
+            "tp_ratio": float(tr),
+        })
+
+    # sort
+    key_map = {
+        "fp_ratio": lambda r: (r["fp_ratio"], r["fp_cnt"], r["size"]),
+        "fp_cnt": lambda r: (r["fp_cnt"], r["fp_ratio"], r["size"]),
+        "size": lambda r: (r["size"], r["fp_cnt"], r["fp_ratio"]),
+        "tp_cnt": lambda r: (r["tp_cnt"], -r["fp_ratio"], r["size"]),
+    }
+    if sort_by not in key_map:
+        raise ValueError(f"unknown sort_by={sort_by}")
+    rows.sort(key=key_map[sort_by], reverse=True)
+
+    # total
+    fp_total = int((y_true == benign_label).sum())
+    tp_total = int((y_true == pos_label).sum())
+    n_total = int(len(y_true))
+
+    # output
+    print(f"\n========== Cluster-level FP/TP statistics (sort_by={sort_by}) ==========")
+    header = f"{'CID':>6} | {'size':>9} | {'#FP':>7} | {'FP_ratio':>8} | {'#TP':>9} | {'TP_ratio':>8} | {'FP_cov':>7} | {'TP_cov':>7}"
+    print(header)
+    print("-" * len(header))
+
+    fp_cov_cum = 0
+    tp_cov_cum = 0
+    for i, r in enumerate(rows[:topn]):
+        fp_cov_cum += r["fp_cnt"]
+        tp_cov_cum += r["tp_cnt"]
+        fp_cov = fp_cov_cum / fp_total if fp_total > 0 else 0.0
+        tp_cov = tp_cov_cum / tp_total if tp_total > 0 else 0.0
+        print(
+            f"{r['cid']:>6} | {r['size']:>9} | {r['fp_cnt']:>7} | {r['fp_ratio']:>8.3f} | {r['tp_cnt']:>9} | {r['tp_ratio']:>8.3f} | {fp_cov:>7.3f} | {tp_cov:>7.3f}")
+
+    print("\n[INFO] total samples:", n_total)
+    print("[INFO] FP_total:", fp_total, " TP_total:", tp_total)
+    return rows
+
+
+def robust_z(x):
+    x = np.asarray(x, dtype=float)
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    mad = mad if mad > 1e-12 else 1.0
+    return 0.6745 * (x - med) / mad
+
+
+def merge_micro_clusters(X, labels, min_size=20):
+    """
+    Reassign samples in clusters smaller than min_size to the nearest cluster that meets the size requirement.
+    """
+    print(f"\n[Merge] merging micro-clusters (Size < {min_size})...")
+
+    # 1. Count cluster sizes
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    cluster_size_map = dict(zip(unique_labels, counts))
+
+    # 2. Separate core clusters from micro-clusters
+    core_mask = np.array([cluster_size_map[l] >= min_size for l in labels])
+    micro_mask = ~core_mask
+
+    n_micro = np.sum(micro_mask)
+    if n_micro == 0:
+        print("[Merge] no micro-clusters found, nothing to merge.")
+        return labels
+
+    print(f"[Merge] {n_micro} samples belong to micro-clusters; reassigning...")
+
+    # 3. Train a lightweight kNN on core-cluster samples only
+    X_core = X[core_mask]
+    y_core = labels[core_mask]
+
+    # keep k small for speed, e.g., 3 or 5
+    # Single-threaded prediction avoids platform-dependent tie ordering in the
+    # reproducible graph-community protocol.
+    knn_cleaner = KNeighborsClassifier(n_neighbors=5, n_jobs=1)
+    knn_cleaner.fit(X_core, y_core)
+
+    # 4. Predict new assignments for micro-cluster samples
+    X_micro = X[micro_mask]
+    new_labels_micro = knn_cleaner.predict(X_micro)
+
+    # 5. Update the labels
+    new_labels = labels.copy()
+    new_labels[micro_mask] = new_labels_micro
+
+    # summarize after merging
+    old_n_clusters = len(unique_labels)
+    new_n_clusters = len(np.unique(new_labels))
+    print(f"[Merge] done: cluster count reduced from {old_n_clusters} to {new_n_clusters}")
+
+    return new_labels
+
+
+def plot_fp_filtering_reduction_curve(
+    cluster_labels,
+    y_true,
+    df_stats,
+    benign_label=0,
+    pos_label=1,
+    min_cluster_size=1,
+    title="Community FP-filtering Curve",
+    save_path="./community_fp_filtering_curve.png",
+):
+    """
+    Use the cluster-level fp_ratio as each alarm's FP score:
+        score_i = fp_ratio(cluster_i)
+
+    Scan threshold tau:
+        score_i >= tau -> filtered as a false positive
+        score_i < tau  -> kept as a true alarm
+
+    Curve coordinates:
+        x = R.TPR = filtered TP / total TP
+        y = R.FPR = filtered FP / total FP
+
+    Ideal case:
+        High R.FPR and low R.TPR, i.e., the curve hugs the top-left corner.
+    """
+    cluster_labels = np.asarray(cluster_labels)
+    y_true = np.asarray(y_true)
+
+    fp_total = int((y_true == benign_label).sum())
+    tp_total = int((y_true == pos_label).sum())
+
+    if fp_total == 0 or tp_total == 0:
+        raise ValueError(f"fp_total={fp_total}, tp_total={tp_total}, cannot plot the reduction curve")
+
+    # cid -> fp_ratio / size
+    cid_to_ratio = dict(zip(df_stats["cluster_id"], df_stats["fp_ratio"]))
+    cid_to_size = dict(zip(df_stats["cluster_id"], df_stats["size"]))
+
+    # assign each sample the cluster-level fp_ratio as its FP score
+    sample_score = np.zeros(len(cluster_labels), dtype=float)
+    for i, cid in enumerate(cluster_labels):
+        # Tiny clusters are not filtered; assign score 0 directly
+        if cid_to_size.get(cid, 0) < min_cluster_size:
+            sample_score[i] = 0.0
+        else:
+            sample_score[i] = cid_to_ratio.get(cid, 0.0)
+
+    # scan all possible thresholds
+    thresholds = np.unique(sample_score)
+    thresholds = np.sort(thresholds)[::-1]
+
+    xs_rtpr = [0.0]  # x-axis: fraction of TPs removed
+    ys_rfpr = [0.0]  # y-axis: fraction of FPs removed
+
+    records = []
+
+    for tau in thresholds:
+        mask_filtered = sample_score >= tau
+
+        fp_removed = int(((y_true == benign_label) & mask_filtered).sum())
+        tp_removed = int(((y_true == pos_label) & mask_filtered).sum())
+
+        r_fpr = fp_removed / fp_total
+        r_tpr = tp_removed / tp_total
+
+        xs_rtpr.append(r_tpr)
+        ys_rfpr.append(r_fpr)
+
+        records.append({
+            "tau": float(tau),
+            "filtered_total": int(mask_filtered.sum()),
+            "fp_removed": fp_removed,
+            "tp_removed": tp_removed,
+            "R.FPR": float(r_fpr),
+            "R.TPR": float(r_tpr),
+        })
+
+    # append the endpoint
+    xs_rtpr.append(1.0)
+    ys_rfpr.append(1.0)
+
+    curve_auc = auc(xs_rtpr, ys_rfpr)
+
+    # pick a few representative threshold points for annotation
+    show_taus = [0.9, 0.8, 0.7, 0.5]
+    mark_points = []
+    for st in show_taus:
+        mask = sample_score >= st
+        if mask.sum() == 0:
+            continue
+        fp_removed = int(((y_true == benign_label) & mask).sum())
+        tp_removed = int(((y_true == pos_label) & mask).sum())
+        mark_points.append((
+            tp_removed / tp_total,
+            fp_removed / fp_total,
+            st
+        ))
+
+    plt.rcParams["font.family"] = "Times New Roman"
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax = plt.subplots(figsize=(4.2, 3.8), dpi=300)
+    ax.set_facecolor("#F7F8FA")
+
+    # diagonal: the random-filtering reference line
+    ax.plot([0, 1], [0, 1], "--", color="gray", linewidth=1.0, label="Random")
+
+    # curve: the closer to the top-left, the better
+    ax.plot(xs_rtpr, ys_rfpr, color="#2C5BEA", linewidth=2.2,
+            label=f"Community score AUC={curve_auc:.4f}")
+    ax.fill_between(xs_rtpr, ys_rfpr, 0, color="#4C6FFF", alpha=0.18)
+
+    # annotate threshold points
+    for x, y, tau in mark_points:
+        ax.scatter(x, y, s=45, color="#D7191C", edgecolor="black", zorder=4)
+        ax.text(x + 0.015, y - 0.035, f"{tau:.1f}", fontsize=9)
+
+    # nicer arrow
+    ax.annotate(
+        "Better",
+        xy=(0.13, 0.78),
+        xytext=(0.38, 0.55),
+        arrowprops=dict(arrowstyle="-|>", lw=2.0, color="#333333"),
+        fontsize=13,
+        rotation=-40,
+        ha="center",
+        va="center"
+    )
+
+    ax.text(
+        0.06, 0.88,
+        title,
+        transform=ax.transAxes,
+        fontsize=11,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                  edgecolor="black", linewidth=1.0)
+    )
+
+    ax.set_xlim(0, 1.0)
+    ax.set_ylim(0, 1.05)
+
+    ax.set_xlabel("Reduced TPR (TP removed ratio)", fontsize=12)
+    ax.set_ylabel("Reduced FPR (FP removed ratio)", fontsize=12)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="lower right", fontsize=9, frameon=True)
+
+    plt.tight_layout()
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.savefig(save_path.with_suffix(".svg"), bbox_inches="tight")
+    plt.close()
+
+    curve_df = pd.DataFrame(records)
+    curve_df.to_csv(save_path.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+
+    print(f"[Output] reduction curve saved to: {save_path}")
+    print(f"[Output] reduction curve csv saved to: {save_path.with_suffix('.csv')}")
+    print(f"[INFO] Community FP-filtering AUC = {curve_auc:.6f}")
+
+    return curve_df, curve_auc

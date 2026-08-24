@@ -3,7 +3,7 @@
 5 variants:
     Full           - complete pipeline (reused from batch_output_v7 results)
     w/o FeatSel    - no variance feature selection (full features)
-    w/o Graph->DB  - DBSCAN replaces kNN graph + Leiden
+    w/o Graph->KM  - KMeans replaces kNN graph + Leiden
     w/o AdaptSc    - scoring fixed to density_low (no direction selection)
     w/o Blend      - blend=0 (pure cluster-level scoring)
 
@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 
@@ -38,6 +39,7 @@ CLUSTER_SEED = 42
 K_LIST = [10, 30]
 RES_LIST = [0.5, 1.0, 10.0]
 MS_LIST = [5, 10]
+KM_CLUSTERS_LIST = [10, 20, 50, 100]
 DBSCAN_EPS_LIST = [0.1, 0.3, 0.5, 1.0]
 BLEND_CANDIDATES = [0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
 FIXED_SCORING = "density_low"  # for w/o AdaptSc (pVoxel-style default)
@@ -86,6 +88,17 @@ def leiden_cluster(X, k, res, allow_fallback=False):
         res = 1.0
     cl = run_leiden(G, w, resolution=res, seed=CLUSTER_SEED)
     return cl, kdist
+
+
+def kmeans_cluster(X, n_clusters):
+    """KMeans; kdist computed from a k=10 NN index (for profiles/blend)."""
+    nc = min(n_clusters, len(X) - 1)
+    km = KMeans(n_clusters=nc, random_state=CLUSTER_SEED, n_init=10)
+    labels = km.fit_predict(X)
+    nn = NearestNeighbors(n_neighbors=min(11, len(X)), n_jobs=-1)
+    nn.fit(X)
+    dist, _ = nn.kneighbors(X)
+    return labels, dist[:, -1]
 
 
 def dbscan_cluster(X, eps, min_samples=5):
@@ -214,6 +227,41 @@ def run_wo_featsel(alert_path):
     """w/o FeatSel: identical pipeline on FULL features."""
     data = prepare_data(alert_path, use_featsel=False)
     return run_full_reimpl(data)
+
+
+def run_wo_graph(data):
+    """w/o Graph->KM: KMeans clustering; n_clusters searched on val AUC."""
+    best, best_auc = None, -1
+    for nc in KM_CLUSTERS_LIST:
+        try:
+            cl, kdist = kmeans_cluster(data["X_gs"], nc)
+        except Exception:
+            continue
+        for ms in MS_LIST:
+            cl_m = merge_micro_clusters(data["X_gs"], cl, min_size=ms)
+            df = compute_cluster_profiles(data["X_gs"], cl_m, kdist)
+            for sm in SCORING_METHODS:
+                df_s = unsupervised_score(df, method=sm)
+                r, _ = eval_cluster_scoring(cl_m, data["y_gs"], df_s,
+                                            kdist=kdist, sample_blend=0.0)
+                if r and r["auc"] > best_auc:
+                    best_auc = r["auc"]
+                    best = {"nc": nc, "ms": ms, "scoring": sm, "blend": 0.0}
+    if best is None:
+        return None
+    cl, kdist = kmeans_cluster(data["X_gs"], best["nc"])
+    cl_m = merge_micro_clusters(data["X_gs"], cl, min_size=best["ms"])
+    df = compute_cluster_profiles(data["X_gs"], cl_m, kdist)
+    df_s = unsupervised_score(df, method=best["scoring"])
+    for blend in BLEND_CANDIDATES:
+        r, _ = eval_cluster_scoring(cl_m, data["y_gs"], df_s,
+                                    kdist=kdist, sample_blend=blend)
+        if r and r["auc"] > best_auc:
+            best_auc = r["auc"]
+            best["blend"] = blend
+    return finalize(data,
+                    lambda X: kmeans_cluster(X, best["nc"]),
+                    best["ms"], best["scoring"], best["blend"])
 
 
 def run_wo_graph_db(data):
@@ -346,6 +394,8 @@ def main():
                     r = run_wo_featsel(exp["alert_path"])
                 elif variant == "w/o Graph->DB":
                     r = run_wo_graph_db(prepare_data(exp["alert_path"]))
+                elif variant == "w/o Graph->KM":  # legacy, superseded by DB
+                    r = run_wo_graph(prepare_data(exp["alert_path"]))
                 elif variant == "w/o AdaptSc":
                     r = run_wo_adaptsc(prepare_data(exp["alert_path"]))
                 elif variant == "w/o Blend":

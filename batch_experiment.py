@@ -20,6 +20,7 @@ import traceback
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from scipy.stats import ks_2samp
 from scipy.spatial.distance import cdist, euclidean
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
@@ -49,6 +50,19 @@ def pvoxel_transform(X):
     denom[denom == 0] = 1.0
     X_norm = np.clip((X - X_min) / denom, 0.0, 1.0)
     return np.log2(1.0 + X_norm)
+
+
+def ks_feature_select(X, y, top_k=20):
+    """KS-test feature selection (uses labels - kept for reference/ablation)."""
+    fp_mask = (y == 0)
+    tp_mask = (y == 1)
+    if fp_mask.sum() < 5 or tp_mask.sum() < 5:
+        return list(range(X.shape[1]))
+    ks_stats = np.zeros(X.shape[1])
+    for j in range(X.shape[1]):
+        stat, _ = ks_2samp(X[fp_mask, j], X[tp_mask, j])
+        ks_stats[j] = stat
+    return np.argsort(ks_stats)[::-1][:top_k].tolist()
 
 
 def variance_feature_select(X, top_k=20):
@@ -230,10 +244,7 @@ def unsupervised_score(df_profiles, method="combined"):
     elif signal == "combined":
         # Multi-signal: average of intrinsic signals (no anchor)
         invert = (direction == "inv")
-        signals = [
-            _norm(df["density_size"].values, invert=True),
-            _norm(df["avg_intra_dist"].values),
-        ]
+        signals = [_norm(df["avg_intra_dist"].values)]
         if "avg_kdist" in df.columns:
             signals.append(_norm(df["avg_kdist"].values))
         score = np.mean(signals, axis=0)
@@ -245,9 +256,12 @@ def unsupervised_score(df_profiles, method="combined"):
     return df
 
 
-# All candidate scoring methods (no anchor-dependent ones)
+# All candidate scoring methods (no anchor-dependent ones).
+# NOTE: the density signal (density_size = 1/(avg_intra+eps)) is a monotone
+# transform of avg_intra_dist, so its two directions coincide with intra_low/
+# intra_high and it is excluded as an independent signal to avoid redundancy;
+# density_size is still used inside the combined signal.
 SCORING_METHODS = [
-    "density_low", "density_high",
     "intra_high", "intra_low",
     "kdist_high", "kdist_low",
     "size_small", "size_large",
@@ -284,7 +298,8 @@ def cluster_sample_scores(cluster_labels, df_scored, min_cluster_size=5,
 
 def eval_cluster_scoring(cluster_labels, y_true, df_scored,
                          min_cluster_size=5, benign_label=0, pos_label=1,
-                         kdist=None, sample_blend=0.0, fixed_tau=None):
+                         kdist=None, sample_blend=0.0, fixed_tau=None,
+                         quantile_tau=False, rtpr_budget=0.10):
     """
     Evaluate cluster scoring with optional sample-level blending.
 
@@ -292,26 +307,40 @@ def eval_cluster_scoring(cluster_labels, y_true, df_scored,
     Sample-level signal: global kdist (k-th nearest neighbor distance).
     fixed_tau: if given, metrics are computed at this threshold (selected on
                validation set) instead of being re-optimized on y_true.
+    quantile_tau: if True, fixed_tau is interpreted as a score quantile.
+    rtpr_budget: if set, use safety-budget mode (max R.FPR s.t. R.TPR <= budget).
     """
     sample_score = cluster_sample_scores(cluster_labels, df_scored,
                                          min_cluster_size, kdist, sample_blend)
     return eval_sample_scores(sample_score, y_true, benign_label, pos_label,
-                              fixed_tau=fixed_tau)
+                              fixed_tau=fixed_tau, quantile_tau=quantile_tau,
+                              rtpr_budget=rtpr_budget)
 
 
 def eval_sample_scores(sample_scores, y_true, benign_label=0, pos_label=1,
-                       fixed_tau=None, rtpr_floor=0.02, min_rfpr=0.3):
+                       fixed_tau=None, rtpr_floor=0.02, min_rfpr=0.3,
+                       quantile_tau=False, rtpr_budget=0.10):
     """
     Evaluate per-sample FP scores.
 
-    Operating point selection (only when fixed_tau is None — intended for the
-    validation set): maximize CER = R.FPR / R.TPR subject to
-        R.FPR >= min_rfpr  (must remove a meaningful fraction of FPs)
-        R.TPR >= rtpr_floor (denominator floor — keeps CER bounded & stable)
+    Operating point selection on the validation set (no fixed_tau):
+      - Safety-budget mode (rtpr_budget set): maximize CER = R.FPR / R.TPR
+        subject to R.TPR <= rtpr_budget and R.FPR >= min_rfpr. The budget
+        caps collateral damage on true alarms; within it, the point with
+        the best FP/TP trade-off (CER) is chosen.
+      - Legacy CER mode (rtpr_budget=None): maximize CER = R.FPR / R.TPR
+        subject to R.FPR >= min_rfpr and R.TPR >= rtpr_floor.
     Fallback: max profit (R.FPR - R.TPR) if no point satisfies the constraints.
 
     When fixed_tau is given (test-set evaluation), metrics are computed at
     that threshold directly — no test labels are used for threshold selection.
+
+    quantile_tau: when True, the tau transferred to the test set is a SCORE
+    QUANTILE instead of an absolute score. The validation set selects the
+    operating point, records q = P(score >= tau), and the test set thresholds
+    at the same quantile of ITS OWN score distribution. This is fully
+    unsupervised and robust to score-scale drift between independently
+    clustered val/test sets.
 
     AUC is always computed from the full threshold curve on y_true.
     """
@@ -331,26 +360,62 @@ def eval_sample_scores(sample_scores, y_true, benign_label=0, pos_label=1,
     thresholds = np.sort(np.unique(sample_scores))[::-1]
     curve = []
     best, best_cer = None, -1
+    best_rfpr = -1
 
     for tau in thresholds:
         m = _metrics_at(tau)
         curve.append({"tau": m["tau"], "R.FPR": m["R.FPR"], "R.TPR": m["R.TPR"]})
         if fixed_tau is None:
-            cer = m["R.FPR"] / max(m["R.TPR"], rtpr_floor)
-            if m["R.FPR"] >= min_rfpr and m["R.TPR"] >= rtpr_floor and cer > best_cer:
-                best_cer = cer
-                best = m
+            if rtpr_budget is not None:
+                # Safety-budget mode: max CER s.t. R.TPR <= budget.
+                # The budget caps collateral damage on true alarms; within it,
+                # the point with the best FP/TP trade-off (CER) is chosen.
+                if m["R.TPR"] <= rtpr_budget and m["R.FPR"] >= min_rfpr:
+                    cer = m["R.FPR"] / max(m["R.TPR"], rtpr_floor)
+                    if cer > best_cer:
+                        best_cer = cer
+                        best = m
+            else:
+                # Legacy CER mode
+                cer = m["R.FPR"] / max(m["R.TPR"], rtpr_floor)
+                if m["R.FPR"] >= min_rfpr and m["R.TPR"] >= rtpr_floor and cer > best_cer:
+                    best_cer = cer
+                    best = m
 
     if fixed_tau is not None:
-        best = _metrics_at(fixed_tau)
+        if quantile_tau:
+            # fixed_tau is a quantile q in (0,1]: threshold at the same
+            # quantile of THIS score distribution (top-q fraction retained)
+            q = float(fixed_tau)
+            q = min(max(q, 1e-6), 1.0)
+            tau = float(np.quantile(sample_scores, 1.0 - q))
+        else:
+            tau = float(fixed_tau)
+        best = _metrics_at(tau)
     elif best is None:
-        # Fallback: max profit
-        best_profit = -1
-        for c in curve:
-            profit = c["R.FPR"] - c["R.TPR"]
-            if profit > best_profit:
-                best_profit = profit
-                best = _metrics_at(c["tau"])
+        # Fallback: if no point satisfies all constraints, stay within the
+        # R.TPR budget (drop the min_rfpr requirement) and pick the best CER;
+        # last resort is max profit.
+        if rtpr_budget is not None:
+            for c in curve:
+                if c["R.TPR"] <= rtpr_budget:
+                    cer = c["R.FPR"] / max(c["R.TPR"], rtpr_floor)
+                    if cer > best_cer:
+                        best_cer = cer
+                        best = _metrics_at(c["tau"])
+        if best is None:
+            best_profit = -1
+            for c in curve:
+                profit = c["R.FPR"] - c["R.TPR"]
+                if profit > best_profit:
+                    best_profit = profit
+                    best = _metrics_at(c["tau"])
+
+    if best is not None and fixed_tau is None and quantile_tau:
+        # replace the transferred tau by its quantile
+        best["abs_tau"] = best["tau"]
+        best["quantile"] = float((sample_scores >= best["tau"]).mean())
+        best["tau"] = best["quantile"]
 
     xs = [0.0] + [c["R.TPR"] for c in curve] + [1.0]
     ys = [0.0] + [c["R.FPR"] for c in curve] + [1.0]
@@ -415,7 +480,7 @@ MAX_VAL_FOR_GRIDSEARCH = 20000  # subsample validation set if larger
 
 def run_single_experiment(alert_path, val_ratio=0.3, val_seed=42,
                           top_k_features=20, k_list=None, res_list=None,
-                          ms_list=None, cluster_seed=42):
+                          ms_list=None, cluster_seed=42, quantile_tau=False):
     if k_list is None:
         k_list = [10, 30]
     if res_list is None:
@@ -571,7 +636,8 @@ def run_single_experiment(alert_path, val_ratio=0.3, val_seed=42,
             df_v = unsupervised_score(df_v, method=best_val["scoring"])
             r_val, _ = eval_cluster_scoring(cl_v, y_val, df_v,
                                             kdist=kdist_v,
-                                            sample_blend=best_val.get("blend", 0.0))
+                                            sample_blend=best_val.get("blend", 0.0),
+                                            quantile_tau=quantile_tau)
             if r_val:
                 tau = r_val["tau"]
                 best_val["tau"] = tau
@@ -611,7 +677,8 @@ def run_single_experiment(alert_path, val_ratio=0.3, val_seed=42,
             r_test, _ = eval_cluster_scoring(cl, y_test, df,
                                              kdist=kdist,
                                              sample_blend=best_val.get("blend", 0.0),
-                                             fixed_tau=tau)
+                                             fixed_tau=tau,
+                                             quantile_tau=quantile_tau)
             result["graphsieve"] = r_test
         except Exception as e:
             result["graphsieve"] = None
